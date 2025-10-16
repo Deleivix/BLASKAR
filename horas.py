@@ -5,7 +5,7 @@ import os, re, json, tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-# --- Tkinter opcional (la web/servidor no lo tiene) ---
+# --- Tkinter opcional ---
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -34,6 +34,7 @@ RE_PROYECTOS_TAG = re.compile(r"^\s*Proyectos:\s*$", re.I)
 RE_COD_PROY      = re.compile(r"^\s*(\d{5})\s*[-–]\s*(.+)$", re.U)
 RE_TIPO_HORA     = re.compile(r"^\s*\d+\s*-\s*HORA", re.I)
 RE_HHMM          = re.compile(r"^\s*(\d{1,2})\s*:\s*([0-5]\d)\s*$")
+RE_RECURSO       = re.compile(r"^\s*\d+\s*[-–]\s+\S+", re.U)  # p.ej. "602 - NOMBRE"
 
 GUI_ENABLED = tk is not None
 
@@ -71,7 +72,7 @@ def read_cell(ws, r, c):
     return v.strip() if isinstance(v, str) else str(v).strip()
 
 # ======================================================================================
-# Filtro de filas “basura” (cabeceras repetidas en mitad del archivo)
+# Filtro de filas “basura”
 # ======================================================================================
 
 MONTHS_ES = [
@@ -167,7 +168,6 @@ def open_as_xlsx(path: str):
     if ext == ".xlsx":
         return path, load_workbook(path, data_only=True)
     if ext == ".xls":
-        # 1) pandas + xlrd; 2) Excel COM
         try:
             import pandas as pd
             xls = pd.ExcelFile(path, engine="xlrd")
@@ -197,13 +197,7 @@ def find_all_proyectos_positions(ws) -> List[int]:
                 res.append(r); break
     return res
 
-def extract_recurso_line(ws, proyectos_row: int) -> str:
-    r = proyectos_row - 1
-    parts = [read_cell(ws, r, c) for c in range(1, 7)]
-    return re.sub(r"\s+", " ", " ".join([p for p in parts if p])).strip()
-
 def detect_day_grid(ws) -> Tuple[int, int]:
-    """Devuelve (n_dias, col_inicio_dia1) buscando una fila con la secuencia 1..N."""
     for r in range(1, min(80, ws.max_row)+1):
         c = 1
         while c <= ws.max_column:
@@ -219,21 +213,51 @@ def detect_day_grid(ws) -> Tuple[int, int]:
                         run += 1; expect += 1; k += 1
                     else:
                         break
-                if run >= 28:  # 28..31
+                if run >= 28:
                     return run, start
                 c = k
             else:
                 c += 1
-    return 31, 4  # fallback conservador
+    return 31, 4
+
+def extract_recurso_line(ws, proyectos_row: int,
+                         n_days: Optional[int]=None, day_start: Optional[int]=None) -> str:
+    """Busca hacia arriba hasta hallar un recurso válido, ignorando cabeceras."""
+    if n_days is None or day_start is None:
+        try:
+            n_days2, day_start2 = detect_day_grid(ws)
+        except Exception:
+            n_days2, day_start2 = 31, 4
+    else:
+        n_days2, day_start2 = n_days, day_start
+
+    r = proyectos_row - 1
+    while r >= 1:
+        if _row_has_month_banner(ws, r) or _row_is_header_recurso(ws, r) or _row_is_header_dow(ws, r, day_start2, n_days2):
+            r -= 1
+            continue
+
+        parts = [read_cell(ws, r, c) for c in range(1, 7)]
+        s = re.sub(r"\s+", " ", " ".join([p for p in parts if p])).strip()
+        if RE_RECURSO.match(s):
+            return s
+        r -= 1
+    return "RECURSO DESCONOCIDO"
 
 # ======================================================================================
 # Parseo del bloque
 # ======================================================================================
 
+@dataclass
+class RowData:
+    recurso: str
+    proyecto_codigo: Optional[str] = None
+    proyecto_nombre: Optional[str] = None
+    tipo_proyecto: Optional[str] = None
+    tipo_imputacion: Optional[str] = None
+    horas_por_dia: List[str] = field(default_factory=list)
+
 def parse_block(ws, r1, r2, recurso, n_days, day_start) -> List[RowData]:
-    """
-    Solo filas de imputación entre r1..r2.
-    """
     rows = []
     proyecto_actual = None
     seq_max = 0
@@ -250,7 +274,6 @@ def parse_block(ws, r1, r2, recurso, n_days, day_start) -> List[RowData]:
         if is_garbage_row(ws, r, day_start, n_days):
             continue
 
-        # ¿Nueva línea con proyecto?
         proj = None; proj_col = None
         for c in (1, 2):
             t = read_cell(ws, r, c)
@@ -281,12 +304,10 @@ def parse_block(ws, r1, r2, recurso, n_days, day_start) -> List[RowData]:
         if not proyecto_actual or descartar_hasta_proyecto:
             continue
 
-        # Fila con tipo
         tipo, _ = first_tipo_in_cols(r)
         if tipo:
             m = re.match(r"^\s*(\d+)\s*-\s*", tipo); idx = int(m.group(1)) if m else 0
             if idx <= seq_max:
-                # retroceso del índice => sección de resumen
                 descartar_hasta_proyecto = True
                 continue
             seq_max = idx
@@ -323,12 +344,12 @@ def style_row(ws, row_idx, color, n_cols):
         return
     fill = PatternFill("solid", fgColor=color)
     border = Border(left=Side(style="thin"), right=Side(style="thin"),
-                    top=Side(style="thin"), bottom=Side(style="thin"))
+                    top=Side(style="thin"), bottom=Side("thin"))
     for c in range(1, n_cols+1):
         cell = ws.cell(row=row_idx, column=c)
         cell.fill = fill; cell.border = border
 
-def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
+def build_output(wb_out, rows: List['RowData'], persist: 'Persist', n_days: int):
     if SHEET_SALIDA in wb_out.sheetnames:
         del wb_out[SHEET_SALIDA]
     ws = wb_out.create_sheet(SHEET_SALIDA)
@@ -372,7 +393,7 @@ def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
         ws.cell(row=rr, column=3, value=round(v/60.0, 2))
         rr += 1
 
-    # Totales por tipo de proyecto + columna TOTAL*27
+    # Totales por tipo de proyecto + TOTAL*27
     sum_tipo = {"CONSTRUCCION": 0, "REPARACION": 0}
     for rd in rows:
         if not rd.tipo_imputacion or rd.tipo_proyecto not in sum_tipo:
@@ -380,9 +401,8 @@ def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
         sum_tipo[rd.tipo_proyecto] += sum(hhmm_to_minutes(x) for x in rd.horas_por_dia[:n_days])
 
     ws.cell(row=rr + 1, column=1, value="TOTALES POR TIPO DE PROYECTO")
-    # Cabecera sombreada extendida para la nueva columna
     style_row(ws, rr + 1, COLOR_HEADER, 3 + n_days + 4)
-    ws.cell(row=rr + 1, column=4, value="TOTAL*27")  # etiqueta nueva columna
+    ws.cell(row=rr + 1, column=4, value="TOTAL*27")
 
     rtp = rr + 2
     for key in ("CONSTRUCCION", "REPARACION"):
@@ -400,7 +420,7 @@ def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
 # Pipeline
 # ======================================================================================
 
-def collect_discovered(recursos: List[str], proyectos: Dict[str, str], persist: Persist):
+def collect_discovered(recursos: List[str], proyectos: Dict[str, str], persist: 'Persist'):
     changed = False
     for cod, nom in proyectos.items():
         if cod not in persist.tipos:
@@ -412,7 +432,7 @@ def collect_discovered(recursos: List[str], proyectos: Dict[str, str], persist: 
     if changed:
         persist.save()
 
-def process_file(input_path: str, persist: Persist) -> str:
+def process_file(input_path: str, persist: 'Persist') -> str:
     xlsx_path, wb = open_as_xlsx(input_path); ws = wb.active
     pos = find_all_proyectos_positions(ws)
     if not pos:
@@ -420,7 +440,6 @@ def process_file(input_path: str, persist: Persist) -> str:
 
     n_days, day_start = detect_day_grid(ws)
 
-    # bloques [Proyectos: .. hasta 2 filas antes del siguiente Proyectos:]
     bloques = []
     for i, r in enumerate(pos):
         r1 = r
@@ -430,7 +449,7 @@ def process_file(input_path: str, persist: Persist) -> str:
 
     all_rows = []; recursos = []; proyectos = {}
     for (r1, r2) in bloques:
-        recurso = extract_recurso_line(ws, r1) or "RECURSO DESCONOCIDO"
+        recurso = extract_recurso_line(ws, r1, n_days, day_start) or "RECURSO DESCONOCIDO"
         if recurso not in recursos:
             recursos.append(recurso)
         rows = parse_block(ws, r1, r2, recurso, n_days, day_start)
@@ -441,7 +460,6 @@ def process_file(input_path: str, persist: Persist) -> str:
 
     collect_discovered(recursos, proyectos, persist)
 
-    # exclusiones
     all_rows = [
         rd for rd in all_rows
         if rd.recurso not in persist.excluir_recursos
@@ -540,10 +558,12 @@ if GUI_ENABLED:
                 messagebox.showwarning("Atención", "Selecciona primero un archivo Excel."); return
             try:
                 xlsx, wb = open_as_xlsx(self.input_path.get()); ws = wb.active
+                n_days, day_start = detect_day_grid(ws)
                 pos = find_all_proyectos_positions(ws)
                 recursos = set(); proyectos = {}
                 for i, r in enumerate(pos):
-                    recurso = extract_recurso_line(ws, r) or "RECURSO DESCONOCIDO"; recursos.add(recurso)
+                    recurso = extract_recurso_line(ws, r, n_days, day_start) or "RECURSO DESCONOCIDO"
+                    recursos.add(recurso)
                     r1 = r; r2 = pos[i+1]-2 if i < len(pos)-1 else min(ws.max_row, r+120)
                     for rr in range(r1, r2+1):
                         t = read_cell(ws, rr, 1) or read_cell(ws, rr, 2)
@@ -597,7 +617,7 @@ if GUI_ENABLED:
             messagebox.showinfo("Listo", f"Generado:\n{out}")
 
 else:
-    App = None  # Import seguro en entornos sin GUI
+    App = None
 
 # ======================================================================================
 # Lanzador
