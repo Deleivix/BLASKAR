@@ -233,10 +233,6 @@ def detect_day_grid(ws) -> Tuple[int, int]:
 def parse_block(ws, r1, r2, recurso, n_days, day_start) -> List[RowData]:
     """
     Solo filas de imputación entre r1..r2.
-    - Proyecto en col 1/2; tipo en la misma fila o posteriores (col 1/2/3).
-    - Anti-resumen: índice N de "N-HORA ..." debe crecer por proyecto; si baja, se ignoran
-      filas restantes hasta el siguiente proyecto.
-    - Horas por columnas absolutas: desde day_start durante n_days.
     """
     rows = []
     proyecto_actual = None
@@ -290,7 +286,7 @@ def parse_block(ws, r1, r2, recurso, n_days, day_start) -> List[RowData]:
         if tipo:
             m = re.match(r"^\s*(\d+)\s*-\s*", tipo); idx = int(m.group(1)) if m else 0
             if idx <= seq_max:
-                # retroceso del índice => sección de resumen. Saltar hasta nuevo proyecto
+                # retroceso del índice => sección de resumen
                 descartar_hasta_proyecto = True
                 continue
             seq_max = idx
@@ -376,7 +372,7 @@ def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
         ws.cell(row=rr, column=3, value=round(v/60.0, 2))
         rr += 1
 
-    # Totales por tipo de proyecto
+    # Totales por tipo de proyecto + columna TOTAL*27
     sum_tipo = {"CONSTRUCCION": 0, "REPARACION": 0}
     for rd in rows:
         if not rd.tipo_imputacion or rd.tipo_proyecto not in sum_tipo:
@@ -384,12 +380,20 @@ def build_output(wb_out, rows: List[RowData], persist: Persist, n_days: int):
         sum_tipo[rd.tipo_proyecto] += sum(hhmm_to_minutes(x) for x in rd.horas_por_dia[:n_days])
 
     ws.cell(row=rr + 1, column=1, value="TOTALES POR TIPO DE PROYECTO")
-    style_row(ws, rr + 1, COLOR_HEADER, 3 + n_days + 3)
+    # Cabecera sombreada extendida para la nueva columna
+    style_row(ws, rr + 1, COLOR_HEADER, 3 + n_days + 4)
+    ws.cell(row=rr + 1, column=4, value="TOTAL*27")  # etiqueta nueva columna
+
     rtp = rr + 2
     for key in ("CONSTRUCCION", "REPARACION"):
+        total_min = sum_tipo[key]
+        total_dec = round(total_min / 60.0, 2)
+        total_x27 = round(total_dec * 27.0, 2)
+
         ws.cell(row=rtp, column=1, value=key)
-        ws.cell(row=rtp, column=2, value=minutes_to_hhmm(sum_tipo[key]))
-        ws.cell(row=rtp, column=3, value=round(sum_tipo[key] / 60.0, 2))
+        ws.cell(row=rtp, column=2, value=minutes_to_hhmm(total_min))
+        ws.cell(row=rtp, column=3, value=total_dec)
+        ws.cell(row=rtp, column=4, value=total_x27)
         rtp += 1
 
 # ======================================================================================
